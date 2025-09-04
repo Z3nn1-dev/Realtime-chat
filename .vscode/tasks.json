@@ -1,0 +1,17 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Start Live Chat Server",
+			"type": "shell",
+			"command": "npm start",
+			"args": [],
+			"group": "build",
+			"isBackground": true,
+			"problemMatcher": [],
+			"options": {
+				"cwd": "${workspaceFolder}/Server"
+			}
+		}
+	]
+}
