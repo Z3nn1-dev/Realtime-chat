@@ -18,13 +18,17 @@ const PORT = process.env.PORT || 3001;
 // Middleware
 app.use(cors());
 app.use(express.json());
-app.use(express.static(path.join(__dirname, '../Client')));
+// Remove static serving since Client folder moved to HM_career
+// app.use(express.static(path.join(__dirname, '../Client')));
 
 // Store connected users and chat sessions
 let connectedUsers = new Map();
 let admins = new Set(); // Store admin socket IDs
 let customerSessions = new Map(); // Map of customer sessions: sessionId -> { customer, admin, messages }
+let closedSessions = new Map(); // Map of closed sessions for history viewing
 let availableAdmins = new Set(); // Available admins for new sessions
+let customerHistory = new Map(); // Track customer history by name: name -> { sessions, totalMessages, lastSeen }
+let clientHistory = new Map(); // Track client IDs and their associated customer names: clientId -> { names: [], lastSeen }
 
 // Socket.IO connection handling
 io.on('connection', (socket) => {
@@ -32,13 +36,20 @@ io.on('connection', (socket) => {
 
   // Handle user join
   socket.on('join', (userData) => {
+    console.log('User joining with data:', userData);
+    
     const user = {
       id: socket.id,
       name: userData.name,
       isAdmin: userData.isAdmin || false,
+      clientId: userData.clientId || null,
       joinTime: new Date(),
       sessionId: null
     };
+    
+    if (userData.clientId) {
+      console.log(`Customer joining with client ID: ${userData.clientId}`);
+    }
     
     connectedUsers.set(socket.id, user);
     
@@ -47,21 +58,116 @@ io.on('connection', (socket) => {
       availableAdmins.add(socket.id);
       socket.join('admins');
       
+      console.log('admin joined as admin');
+      
       // Send list of active sessions to admin
       sendSessionListToAdmins();
+      
+      // Send closed sessions to admin
+      sendClosedSessionsToAdmins();
     } else {
-      // Customer joins - create or find session
-      const sessionId = createCustomerSession(socket.id, user);
+      // Customer joins - check for existing client ID first
+      let sessionId;
+      let isReturningClient = false;
+      
+      if (user.clientId && clientHistory.has(user.clientId)) {
+        // This is a returning client - check for recent closed sessions
+        const recentClosedSession = findRecentClosedSessionByClientId(user.clientId);
+        
+        if (recentClosedSession) {
+          console.log(`Returning client ${user.clientId} found with recent session: ${recentClosedSession.id}`);
+          isReturningClient = true;
+          
+          // Create new session but link to previous history
+          sessionId = createCustomerSession(socket.id, user, recentClosedSession);
+        } else {
+          // Client has history but no recent closed session, create new session
+          sessionId = createCustomerSession(socket.id, user);
+          isReturningClient = true;
+        }
+      } else {
+        // New client, create fresh session
+        sessionId = createCustomerSession(socket.id, user);
+      }
+      
       user.sessionId = sessionId;
       
       // Notify customer about session
+      const welcomeMessage = isReturningClient 
+        ? 'Welcome back! We can see your previous conversations. An admin will join shortly to continue helping you.'
+        : 'Welcome to customer support! You can start asking questions. An admin will join shortly to help you.';
+        
       socket.emit('session_created', { 
         sessionId: sessionId,
-        message: 'Welcome to customer support! You can start asking questions. An admin will join shortly to help you.'
+        message: welcomeMessage,
+        isReturningClient: isReturningClient
       });
     }
 
     console.log(`${user.name} joined ${user.isAdmin ? 'as admin' : `as customer with session ${user.sessionId}`}`);
+  });
+
+  // Handle session rejoin (for returning users)
+  socket.on('rejoin_session', (data) => {
+    const { sessionId, user: userData } = data;
+    
+    if (!sessionId || !customerSessions.has(sessionId)) {
+      // Session doesn't exist, treat as new join
+      socket.emit('session_invalid', { 
+        message: 'Session no longer exists. Starting a new session...'
+      });
+      
+      // Create new session
+      const user = {
+        id: socket.id,
+        name: userData.name,
+        isAdmin: false,
+        joinTime: new Date(),
+        sessionId: null
+      };
+      
+      connectedUsers.set(socket.id, user);
+      const newSessionId = createCustomerSession(socket.id, user);
+      user.sessionId = newSessionId;
+      
+      socket.emit('session_created', { 
+        sessionId: newSessionId,
+        message: 'New session created. An admin will join shortly to help you.'
+      });
+      return;
+    }
+    
+    // Session exists, rejoin it
+    const session = customerSessions.get(sessionId);
+    const user = {
+      id: socket.id,
+      name: userData.name,
+      isAdmin: false,
+      joinTime: new Date(),
+      sessionId: sessionId
+    };
+    
+    connectedUsers.set(socket.id, user);
+    // Fix: Update session.customer with the full user object, not just socket.id
+    session.customer = user;
+    session.status = 'active'; // Update status since customer has rejoined
+    
+    // Notify about successful rejoin
+    socket.emit('session_rejoined', { 
+      sessionId: sessionId,
+      message: 'Reconnected to your previous session.',
+      hasAdmin: session.admin !== null
+    });
+    
+    // If admin is still in session, notify them
+    if (session.admin && connectedUsers.has(session.admin)) {
+      io.to(session.admin).emit('customer_rejoined', {
+        sessionId: sessionId,
+        customerName: user.name
+      });
+    }
+    
+    console.log(`${user.name} rejoined session ${sessionId}`);
   });
 
   // Handle new messages
@@ -119,6 +225,11 @@ io.on('connection', (socket) => {
       
       session.messages.push(message);
       
+      // Track customer message in history
+      if (!user.isAdmin) {
+        incrementCustomerMessages(user.name);
+      }
+      
       // Send to admin in this session (if any)
       if (session.admin) {
         io.to(session.admin.id).emit('receive_message', message);
@@ -154,6 +265,27 @@ io.on('connection', (socket) => {
       console.log(`Session ${data.sessionId} not found`);
       socket.emit('error', { message: 'Session not found' });
     }
+  });
+
+  // Handle getting client history by client ID
+  socket.on('get_client_history', (data) => {
+    console.log(`Admin requesting client history for client ID: ${data.clientId}`);
+    
+    const admin = connectedUsers.get(socket.id);
+    if (!admin || !admin.isAdmin) {
+      socket.emit('error', { message: 'Unauthorized access' });
+      return;
+    }
+    
+    const clientHistory = getClientChatHistory(data.clientId);
+    console.log(`Found ${clientHistory.sessions.length} previous sessions for client ${data.clientId}`);
+    
+    socket.emit('client_history', {
+      clientId: data.clientId,
+      sessions: clientHistory.sessions,
+      totalSessions: clientHistory.totalSessions,
+      totalMessages: clientHistory.totalMessages
+    });
   });
 
   // Handle admin joining a session
@@ -248,8 +380,8 @@ io.on('connection', (socket) => {
             });
           }
           
-          // Remove session
-          customerSessions.delete(sessionId);
+          // Move session to closed sessions instead of deleting
+          moveSessionToClosed(sessionId);
           
           // Make admin available again
           if (session.admin) {
@@ -257,13 +389,41 @@ io.on('connection', (socket) => {
             availableAdmins.add(session.admin.id);
           }
           
-          sendSessionListToAdmins();
+          // Send updated closed sessions list to admins
+          sendClosedSessionsToAdmins();
         }
         break;
         
       case 'transfer_session':
         // Transfer session to another admin (future feature)
         break;
+    }
+  });
+
+  // Handle request for closed sessions
+  socket.on('get_closed_sessions', () => {
+    const user = connectedUsers.get(socket.id);
+    if (!user || !user.isAdmin) return;
+    
+    sendClosedSessionsToAdmins();
+  });
+
+  // Handle request to view closed session messages
+  socket.on('view_closed_session', (data) => {
+    const user = connectedUsers.get(socket.id);
+    if (!user || !user.isAdmin) return;
+    
+    const session = closedSessions.get(data.sessionId);
+    if (session) {
+      socket.emit('closed_session_messages', {
+        sessionId: data.sessionId,
+        customer: session.customer,
+        admin: session.admin,
+        messages: session.messages,
+        createdAt: session.createdAt,
+        closedAt: session.closedAt,
+        status: session.status
+      });
     }
   });
 
@@ -308,25 +468,23 @@ io.on('connection', (socket) => {
         if (user.sessionId) {
           const session = customerSessions.get(user.sessionId);
           if (session) {
-            // Keep session for a while in case customer reconnects
-            session.customer = null;
+            // Keep customer info but mark as disconnected
+            if (session.customer) {
+              session.customer.isConnected = false;
+              session.customer.disconnectedAt = new Date();
+            }
             session.status = 'customer_disconnected';
             
             if (session.admin) {
               io.to(session.admin.id).emit('customer_disconnected', {
                 sessionId: user.sessionId,
-                message: 'Customer has disconnected'
+                customerName: user.name,
+                message: `${user.name} has disconnected`
               });
             }
             
-            // Remove session after 5 minutes if customer doesn't return
-            setTimeout(() => {
-              if (customerSessions.has(user.sessionId) && 
-                  customerSessions.get(user.sessionId).status === 'customer_disconnected') {
-                customerSessions.delete(user.sessionId);
-                sendSessionListToAdmins();
-              }
-            }, 5 * 60 * 1000); // 5 minutes
+            // Move session to closed immediately when customer disconnects
+            moveSessionToClosed(user.sessionId);
           }
         }
       }
@@ -336,9 +494,39 @@ io.on('connection', (socket) => {
   });
 });
 
+// Function to move session to closed sessions
+function moveSessionToClosed(sessionId) {
+  const session = customerSessions.get(sessionId);
+  if (session) {
+    // Mark session as closed
+    session.closedAt = new Date();
+    session.status = 'closed';
+    
+    // Move to closed sessions
+    closedSessions.set(sessionId, session);
+    
+    // Remove from active sessions
+    customerSessions.delete(sessionId);
+    
+    console.log(`Session ${sessionId} moved to closed sessions`);
+    
+    // Update admin interface
+    sendSessionListToAdmins();
+    sendClosedSessionsToAdmins();
+  }
+}
+
 // Function to create a new customer session
-function createCustomerSession(customerId, customer) {
+function createCustomerSession(customerId, customer, previousSession = null) {
   const sessionId = `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  
+  // Track customer history
+  updateCustomerHistory(customer.name);
+  
+  // Track client ID history if provided
+  if (customer.clientId) {
+    updateClientHistory(customer.clientId, customer.name);
+  }
   
   const session = {
     id: sessionId,
@@ -346,12 +534,26 @@ function createCustomerSession(customerId, customer) {
     admin: null,
     messages: [],
     createdAt: new Date(),
-    status: 'waiting_for_admin'
+    status: 'waiting_for_admin',
+    customerHistory: getCustomerHistorySummary(customer.name),
+    clientHistory: customer.clientId ? getClientHistorySummary(customer.clientId) : null,
+    previousSession: previousSession ? {
+      id: previousSession.id,
+      messageCount: previousSession.messages ? previousSession.messages.length : 0,
+      closedAt: previousSession.closedAt,
+      lastActivity: previousSession.lastActivity
+    } : null
   };
   
   customerSessions.set(sessionId, session);
   
   console.log(`Created new session: ${sessionId} for customer: ${customer.name}`);
+  if (customer.clientId) {
+    console.log(`Client ID: ${customer.clientId}`);
+    if (previousSession) {
+      console.log(`Linked to previous session: ${previousSession.id}`);
+    }
+  }
   console.log(`Total active sessions: ${customerSessions.size}`);
   
   // Notify available admins about new session
@@ -363,7 +565,8 @@ function createCustomerSession(customerId, customer) {
     io.to('admins').emit('new_session_alert', {
       sessionId: sessionId,
       customerName: customer.name,
-      message: `New customer support session from ${customer.name}`
+      message: `New customer support session from ${customer.name}`,
+      isReturningClient: previousSession !== null
     });
   }
   
@@ -376,6 +579,33 @@ function sendSessionListToAdmins() {
     id: session.id,
     customer: session.customer ? {
       name: session.customer.name,
+      id: session.customer.id,
+      clientId: session.customer.clientId,
+      isConnected: session.customer.isConnected !== false, // Default true unless explicitly set false
+      disconnectedAt: session.customer.disconnectedAt
+    } : null,
+    admin: session.admin ? {
+      name: session.admin.name,
+      id: session.admin.id
+    } : null,
+    messageCount: session.messages.length,
+    createdAt: session.createdAt,
+    status: session.status,
+    customerHistory: session.customerHistory, // Include customer history
+    clientHistory: session.clientHistory, // Include client history
+    previousSession: session.previousSession // Include previous session info
+  }));
+  
+  console.log(`Sending session list update to ${admins.size} admins:`, sessionList.length, 'sessions');
+  io.to('admins').emit('session_list_update', sessionList);
+}
+
+// Function to send closed sessions list to all admins
+function sendClosedSessionsToAdmins() {
+  const closedSessionList = Array.from(closedSessions.values()).map(session => ({
+    id: session.id,
+    customer: session.customer ? {
+      name: session.customer.name,
       id: session.customer.id
     } : null,
     admin: session.admin ? {
@@ -384,11 +614,13 @@ function sendSessionListToAdmins() {
     } : null,
     messageCount: session.messages.length,
     createdAt: session.createdAt,
-    status: session.status
+    closedAt: session.closedAt,
+    status: session.status,
+    customerHistory: session.customerHistory
   }));
   
-  console.log(`Sending session list update to ${admins.size} admins:`, sessionList.length, 'sessions');
-  io.to('admins').emit('session_list_update', sessionList);
+  console.log(`Sending closed sessions list to ${admins.size} admins:`, closedSessionList.length, 'closed sessions');
+  io.to('admins').emit('closed_sessions_update', closedSessionList);
 }
 
 // Function to send session list to a specific admin
@@ -416,8 +648,142 @@ app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, '../Client/index.html'));
 });
 
+// Customer history tracking functions
+function updateCustomerHistory(customerName) {
+  if (!customerHistory.has(customerName)) {
+    customerHistory.set(customerName, {
+      sessions: 0,
+      totalMessages: 0,
+      lastSeen: new Date(),
+      firstSeen: new Date()
+    });
+  }
+  
+  const history = customerHistory.get(customerName);
+  history.sessions += 1;
+  history.lastSeen = new Date();
+  
+  return history;
+}
+
+function getCustomerHistorySummary(customerName) {
+  const history = customerHistory.get(customerName);
+  if (!history) return null;
+  
+  return {
+    previousSessions: history.sessions - 1, // -1 for current session
+    totalMessages: history.totalMessages,
+    isReturning: history.sessions > 1,
+    firstSeen: history.firstSeen,
+    lastSeen: history.lastSeen
+  };
+}
+
+function incrementCustomerMessages(customerName) {
+  if (customerHistory.has(customerName)) {
+    customerHistory.get(customerName).totalMessages += 1;
+  }
+}
+
+function updateClientHistory(clientId, customerName) {
+  if (!clientHistory.has(clientId)) {
+    clientHistory.set(clientId, {
+      names: [],
+      firstSeen: new Date(),
+      lastSeen: new Date(),
+      totalSessions: 0
+    });
+  }
+  
+  const history = clientHistory.get(clientId);
+  
+  // Add name if not already in the list
+  if (!history.names.includes(customerName)) {
+    history.names.push(customerName);
+  }
+  
+  history.lastSeen = new Date();
+  history.totalSessions += 1;
+  
+  return history;
+}
+
+function getClientHistorySummary(clientId) {
+  const history = clientHistory.get(clientId);
+  if (!history) return null;
+  
+  return {
+    previousNames: history.names,
+    totalSessions: history.totalSessions - 1, // -1 for current session
+    isReturning: history.totalSessions > 1,
+    firstSeen: history.firstSeen,
+    lastSeen: history.lastSeen
+  };
+}
+
+function findRecentClosedSessionByClientId(clientId) {
+  // Look for the most recent closed session from this client ID
+  let recentSession = null;
+  let recentDate = null;
+  
+  for (const session of closedSessions.values()) {
+    if (session.customer && session.customer.clientId === clientId) {
+      const sessionDate = new Date(session.closedAt || session.lastActivity || session.createdAt);
+      if (!recentDate || sessionDate > recentDate) {
+        recentDate = sessionDate;
+        recentSession = session;
+      }
+    }
+  }
+  
+  // Only return sessions closed within the last 24 hours
+  if (recentSession && recentDate) {
+    const hoursSinceClose = (Date.now() - recentDate.getTime()) / (1000 * 60 * 60);
+    if (hoursSinceClose <= 24) {
+      return recentSession;
+    }
+  }
+  
+  return null;
+}
+
+function getClientChatHistory(clientId) {
+  const historySessions = [];
+  let totalMessages = 0;
+  
+  // Get all closed sessions for this client ID
+  for (const session of closedSessions.values()) {
+    if (session.customer && session.customer.clientId === clientId) {
+      const sessionInfo = {
+        id: session.id,
+        customerName: session.customer.name,
+        messages: session.messages || [],
+        createdAt: session.createdAt,
+        closedAt: session.closedAt || session.lastActivity,
+        messageCount: session.messages ? session.messages.length : 0,
+        adminName: session.admin ? session.admin.name : 'No admin assigned'
+      };
+      
+      historySessions.push(sessionInfo);
+      totalMessages += sessionInfo.messageCount;
+    }
+  }
+  
+  // Sort sessions by creation date (newest first)
+  historySessions.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  
+  return {
+    sessions: historySessions,
+    totalSessions: historySessions.length,
+    totalMessages: totalMessages
+  };
+}
+
 app.get('/admin', (req, res) => {
-  res.sendFile(path.join(__dirname, '../Client/admin.html'));
+  res.json({ 
+    message: 'Admin panel available at frontend server',
+    admin: 'http://localhost:8080/Client/admin.html'
+  });
 });
 
 server.listen(PORT, () => {
