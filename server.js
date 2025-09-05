@@ -646,11 +646,6 @@ function sendSessionListToAdmin(adminId) {
   io.to(adminId).emit('session_list_update', sessionList);
 }
 
-// Serve the client files
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, '../Client/index.html'));
-});
-
 // Customer history tracking functions
 function updateCustomerHistory(customerName) {
   if (!customerHistory.has(customerName)) {
@@ -811,3 +806,4 @@ server.listen(PORT, () => {
   console.log(`Client: http://localhost:${PORT}`);
   console.log(`Admin: http://localhost:${PORT}/admin`);
 });
+
