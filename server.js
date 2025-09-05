@@ -2,7 +2,6 @@ const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
 const cors = require('cors');
-const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
@@ -16,10 +15,14 @@ const io = socketIo(server, {
 const PORT = process.env.PORT || 3001;
 
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST"],
+  credentials: true
+}));
 app.use(express.json());
-// Remove static serving since Client folder moved to HM_career
-// app.use(express.static(path.join(__dirname, '../Client')));
+
+// Remove any static file serving - Client folder moved to separate frontend
 
 // Store connected users and chat sessions
 let connectedUsers = new Map();
@@ -779,10 +782,27 @@ function getClientChatHistory(clientId) {
   };
 }
 
+// API Routes
+app.get('/', (req, res) => {
+  res.json({
+    message: 'Live Chat Server API',
+    status: 'running',
+    version: '1.0.0',
+    endpoints: {
+      admin: '/admin',
+      socketio: '/socket.io'
+    },
+    frontend: {
+      note: 'Frontend files should be served separately',
+      admin_panel: 'Deploy Client folder as static files'
+    }
+  });
+});
+
 app.get('/admin', (req, res) => {
   res.json({ 
     message: 'Admin panel available at frontend server',
-    admin: 'http://localhost:8080/Client/admin.html'
+    note: 'Admin panel should be served as static files, not from this API server'
   });
 });
 
