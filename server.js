@@ -2,6 +2,7 @@ const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
 const cors = require('cors');
+const axios = require('axios');
 
 const app = express();
 const server = http.createServer(app);
@@ -13,6 +14,25 @@ const io = socketIo(server, {
 });
 
 const PORT = process.env.PORT || 3001;
+
+// Telegram Configuration
+const TELEGRAM_BOT_TOKEN = '8278914551:AAEu0XFT1m8S4uiqI39zLqZbJER9jpRAIm8';
+const TELEGRAM_CHANNEL_ID = '-1003076481039';
+
+// Function to send Telegram notification
+async function sendTelegramNotification(message) {
+  try {
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+    await axios.post(url, {
+      chat_id: TELEGRAM_CHANNEL_ID,
+      text: message,
+      parse_mode: 'HTML'
+    });
+    console.log('Telegram notification sent successfully');
+  } catch (error) {
+    console.error('Error sending Telegram notification:', error.message);
+  }
+}
 
 // Middleware
 app.use(cors({
@@ -558,6 +578,17 @@ function createCustomerSession(customerId, customer, previousSession = null) {
     }
   }
   console.log(`Total active sessions: ${customerSessions.size}`);
+  
+  // Send Telegram notification
+  const notificationMessage = `🔔 <b>New Chat Session Created</b>\n\n` +
+    `👤 Customer: ${customer.name}\n` +
+    `🆔 Session ID: ${sessionId}\n` +
+    `⏰ Time: ${new Date().toLocaleString()}\n` +
+    `${customer.clientId ? `📱 Client ID: ${customer.clientId}\n` : ''}` +
+    `${previousSession ? '🔄 Returning customer' : '🆕 New customer'}\n\n` +
+    `Total active sessions: ${customerSessions.size}`;
+  
+  sendTelegramNotification(notificationMessage);
   
   // Notify available admins about new session
   sendSessionListToAdmins();
